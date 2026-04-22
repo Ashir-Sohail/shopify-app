@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use App\Models\Shop;
+use App\Services\ShopifyService;
 
 
 use Illuminate\Http\Request;
@@ -37,9 +38,16 @@ class ShopifyController extends Controller
     {
         $shop = $request->query('shop');
         $code = $request->query('code');
+        $host = $request->query('host');
+
+        if (!$host) {
+            return redirect()->route('shopify.install', ['shop' => $shop]);
+        }
+
         if (!$shop || !str_ends_with($shop, '.myshopify.com')) {
             abort(400, 'Invalid shop domain');
         }
+
         // 1. Verify HMAC (Crucial for security!)
         // You must verify the 'hmac' query parameter using your API Secret.
         abort_unless($this->verifyHmac($request), 403, 'HMAC failed');
@@ -78,13 +86,19 @@ class ShopifyController extends Controller
                 'scope' => $data['scope'] ?? null,
             ]
         );
-        Log::info('after updateorcreate',[
+        Log::info('after updateorcreate', [
             'shop' => $shop,
             'access_token' => $accessToken,
             'scope' => $data['scope'] ?? null,
         ]);
 
-        return view('shopify-success', ['shop' => $shop]);
+        // return view('shopify-success', ['shop' => $shop]);
+        $host = $request->query('host');
+
+        return redirect()->route('shopify.callback', [
+            'shop' => $shop,
+            'host' => $host
+        ]);
     }
 
     private function verifyHmac(Request $request): bool
@@ -112,16 +126,39 @@ class ShopifyController extends Controller
 
         return hash_equals($computed, $hmac);
     }
+    // public function index(Request $request)
+    // {
+    //     // Retrieve the shop name from the URL parameters
+    //     $shop = $request->query('shop');
+
+    //     if (!$shop) {
+    //         $shop = Shop::latest()->value('shop_domain');
+    //     }
+    //     // Skip HMAC if no params (manual access)
+    //     if ($request->has('hmac') && !$this->verifyHmac($request)) {
+    //         abort(403, 'Unauthorized action.');
+    //     }
+
+    //     return view('index', ['shop' => $shop]);
+    // }
+
     public function index(Request $request)
     {
-        // Retrieve the shop name from the URL parameters
         $shop = $request->query('shop');
-        // Skip HMAC if no params (manual access)
+
+        if (!$shop) {
+            $shop = Shop::latest()->value('shop_domain');
+        }
+
+        // Verify HMAC if present (important when loading inside Shopify)
         if ($request->has('hmac') && !$this->verifyHmac($request)) {
             abort(403, 'Unauthorized action.');
         }
 
-        return view('dummy-dashboard', ['shop' => $shop]);
+        // IMPORTANT: Send the CSP header to allow embedding
+        return response()
+            ->view('index', ['shop' => $shop])
+            ->header('Content-Security-Policy', "frame-ancestors https://admin.shopify.com https://{$shop} https://*.myshopify.com;");
     }
 
 
@@ -133,28 +170,82 @@ class ShopifyController extends Controller
             abort(404, 'Shop not found');
         }
 
-        $query = '
-                {
-                    products(first: 10) {
-                        edges {
-                        node {
-                            id
-                            title
-                            handle
-                        }
-                        }
+        $query = '{
+            products(first: 15, sortKey: CREATED_AT, reverse: true) {
+                edges {
+                    node {
+                        id
+                        title
+                        handle
+                        status
+                        createdAt
                     }
-                }';
+                }
+            }
+       }';
 
-        $response = Http::withHeaders([
-            'X-Shopify-Access-Token' => $shopData->access_token,
-            'Content-Type' => 'application/json',
-        ])->post("https://{$shop}/admin/api/2024-01/graphql.json", [
-            'query' => $query
-        ]);
+        $response = ShopifyService::query($shop, $shopData->access_token, $query);
+        $result = $response->json();
 
-        $products = $response->json();
+        // ERROR HANDLING: Don't use back() here if it's a GET request
+        if (!isset($result['data'])) {
+            Log::error('Shopify API Error', ['response' => $result]);
+            // If it fails, show an error on a specific view or abort
+            return response("Shopify API Error: " . ($result['errors'][0]['message'] ?? 'Unknown'), 500);
+        }
+
+        // Assign the correct variable for the view
+        $products = $result['data']['products'];
 
         return view('products', compact('products', 'shop'));
+    }
+
+    public function storeProduct(Request $request)
+    {
+        $request->validate([
+            'title' => 'required|string|max:255',
+            'description' => 'nullable|string',
+            'shop' => 'required'
+        ]);
+
+        $shop = $request->shop;
+
+        $shopData = Shop::where('shop_domain', $shop)->first();
+
+        if (!$shopData) {
+            return back()->with('error', 'Shop not found');
+        }
+
+        $mutation = '
+            mutation productCreate($input: ProductInput!) {
+            productCreate(input: $input) {
+                product {
+                id
+                title
+                }
+                userErrors {
+                field
+                message
+                }
+            }
+            }';
+
+        $variables = [
+            "input" => [
+                "title" => $request->title,
+                "descriptionHtml" => $request->description,
+                "status" => "ACTIVE"
+            ]
+        ];
+
+        $response = ShopifyService::query($request->shop, $shopData->access_token, $mutation, $variables);
+        $result = $response->json();
+
+        // Check for GraphQL-specific UserErrors
+        if (!empty($result['data']['productCreate']['userErrors'])) {
+            return back()->withErrors($result['data']['productCreate']['userErrors']);
+        }
+
+        return back()->with('success', 'Product created successfully');
     }
 }

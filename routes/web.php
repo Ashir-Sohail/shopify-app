@@ -21,3 +21,4 @@ Route::get('/auth/callback', [ShopifyController::class, 'callback'])->name('shop
 Route::get('/', [ShopifyController::class, 'index'])->name('home');
 
 Route::get('/products/{shop}', [ShopifyController::class, 'products'])->name('shopify.products');
+Route::post('/products/store', [ShopifyController::class, 'storeProduct'])->name('shopify.product.store');
