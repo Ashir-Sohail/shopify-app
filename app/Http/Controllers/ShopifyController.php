@@ -51,11 +51,23 @@ class ShopifyController extends Controller
         // 1. Verify HMAC (Crucial for security!)
         // You must verify the 'hmac' query parameter using your API Secret.
         abort_unless($this->verifyHmac($request), 403, 'HMAC failed');
-        abort_unless(
-            $request->query('state') === session('shopify_oauth_state'),
-            403,
-            'Invalid state'
-        );
+   
+        // In callback()
+        Log::info('OAuth State Check', [
+            'session_state' => session('shopify_oauth_state'),
+            'request_state' => $request->query('state')
+        ]);
+
+        // If session is empty (common in iframes), you may need to rely on HMAC only for the dev phase
+        if (!session()->has('shopify_oauth_state') && app()->environment('local')) {
+            Log::warning('Session state missing, bypassing for local development.');
+        } else {
+            abort_unless(
+                $request->query('state') === session('shopify_oauth_state'),
+                403,
+                'Invalid state'
+            );
+        }
 
         // 2. Exchange Code for Access Token
         $response = Http::post("https://{$shop}/admin/oauth/access_token", [
@@ -95,7 +107,7 @@ class ShopifyController extends Controller
         // return view('shopify-success', ['shop' => $shop]);
         $host = $request->query('host');
 
-        return redirect()->route('shopify.callback', [
+        return redirect()->route('home', [
             'shop' => $shop,
             'host' => $host
         ]);
@@ -126,38 +138,26 @@ class ShopifyController extends Controller
 
         return hash_equals($computed, $hmac);
     }
-    // public function index(Request $request)
-    // {
-    //     // Retrieve the shop name from the URL parameters
-    //     $shop = $request->query('shop');
-
-    //     if (!$shop) {
-    //         $shop = Shop::latest()->value('shop_domain');
-    //     }
-    //     // Skip HMAC if no params (manual access)
-    //     if ($request->has('hmac') && !$this->verifyHmac($request)) {
-    //         abort(403, 'Unauthorized action.');
-    //     }
-
-    //     return view('index', ['shop' => $shop]);
-    // }
 
     public function index(Request $request)
     {
         $shop = $request->query('shop');
+        $host = $request->query('host'); // Capture the host
 
         if (!$shop) {
             $shop = Shop::latest()->value('shop_domain');
         }
 
-        // Verify HMAC if present (important when loading inside Shopify)
         if ($request->has('hmac') && !$this->verifyHmac($request)) {
             abort(403, 'Unauthorized action.');
         }
 
-        // IMPORTANT: Send the CSP header to allow embedding
+        // Pass both shop and host to the view
         return response()
-            ->view('index', ['shop' => $shop])
+            ->view('index', [
+                'shop' => $shop,
+                'host' => $host
+            ])
             ->header('Content-Security-Policy', "frame-ancestors https://admin.shopify.com https://{$shop} https://*.myshopify.com;");
     }
 
